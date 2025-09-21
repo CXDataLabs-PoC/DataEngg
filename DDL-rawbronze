@@ -1,0 +1,33 @@
+%sql
+USE CATALOG hive_metastore;
+
+CREATE SCHEMA IF NOT EXISTS raw_bronze;
+
+STORAGE_ACCOUNT = "cxdlbbronze"
+CONTAINER = "landingzone"
+Folder = "BTC-USD"
+
+lakehouse_path = f"abfss://{CONTAINER}@{STORAGE_ACCOUNT}.dfs.core.windows.net/{Folder}"
+checkpoint_path = lakehouse_path + "_checkpoint/last_trade.json"
+
+client_id = dbutils.secrets.get(scope="landingzone-secret", key="client-id")
+client_secret = dbutils.secrets.get(scope="landingzone-secret", key="client-secret")
+tenant_id = dbutils.secrets.get(scope="landingzone-secret", key="tenant-id")
+
+account_host = f"{STORAGE_ACCOUNT}.dfs.core.windows.net"
+spark.conf.set(f"fs.azure.account.auth.type.{account_host}", "OAuth")
+spark.conf.set(f"fs.azure.account.oauth.provider.type.{account_host}",
+               "org.apache.hadoop.fs.azurebfs.oauth2.ClientCredsTokenProvider")
+spark.conf.set(f"fs.azure.account.oauth2.client.id.{account_host}", client_id)
+spark.conf.set(f"fs.azure.account.oauth2.client.secret.{account_host}", client_secret)
+spark.conf.set(f"fs.azure.account.oauth2.client.endpoint.{account_host}",
+               f"https://login.microsoftonline.com/{tenant_id}/oauth2/token")
+
+CREATE TABLE IF NOT EXISTS raw_bronze.btc_usd_trades
+USING DELTA
+LOCATION 'abfss://landingzone@cxdlbbronze.dfs.core.windows.net/BTC-USD/';
+
+SELECT COUNT(*) AS total_trades,
+       MIN(trade_time) AS first_trade,
+       MAX(trade_time) AS last_trade
+FROM hive_metastore.raw_bronze.btc_usd_trades;
