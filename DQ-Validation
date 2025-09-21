@@ -1,0 +1,184 @@
+%sql
+CREATE SCHEMA IF NOT EXISTS poc_dataengg.monitoring;
+
+CREATE OR REPLACE TABLE poc_dataengg.monitoring.data_quality_log (
+    validation_time TIMESTAMP,
+    job_name STRING,
+    trade_date DATE,
+    rule_name STRING,
+    status BOOLEAN COMMENT 'TRUE if all passed, FALSE if any failed',
+    detail STRING COMMENT 'Extra info like datatype or row count',
+    success_count BIGINT COMMENT 'Number of records that passed this rule',
+    failure_count BIGINT COMMENT 'Number of records that failed this rule',
+    bad_record STRING COMMENT 'Sample JSON of failing records (optional)'
+
+)
+USING DELTA
+PARTITIONED BY (trade_date)
+;
+
+%sql
+Select Count(*) from poc_dataengg.monitoring.data_quality_log
+
+STORAGE_ACCOUNT = "cxdlbbronze"
+CONTAINER = "landingzone"
+Folder = "BTC-USD-Partitioned"
+
+lakehouse_path = f"abfss://{CONTAINER}@{STORAGE_ACCOUNT}.dfs.core.windows.net/{Folder}"
+checkpoint_path = lakehouse_path + "_checkpoint/last_trade.json"
+
+client_id = dbutils.secrets.get(scope="landingzone-secret", key="client-id")
+client_secret = dbutils.secrets.get(scope="landingzone-secret", key="client-secret")
+tenant_id = dbutils.secrets.get(scope="landingzone-secret", key="tenant-id")
+
+account_host = f"{STORAGE_ACCOUNT}.dfs.core.windows.net"
+spark.conf.set(f"fs.azure.account.auth.type.{account_host}", "OAuth")
+spark.conf.set(f"fs.azure.account.oauth.provider.type.{account_host}",
+               "org.apache.hadoop.fs.azurebfs.oauth2.ClientCredsTokenProvider")
+spark.conf.set(f"fs.azure.account.oauth2.client.id.{account_host}", client_id)
+spark.conf.set(f"fs.azure.account.oauth2.client.secret.{account_host}", client_secret)
+spark.conf.set(f"fs.azure.account.oauth2.client.endpoint.{account_host}",
+               f"https://login.microsoftonline.com/{tenant_id}/oauth2/token")
+
+
+
+from pyspark.sql.types import (
+    StructType, StructField,
+    LongType, DecimalType, StringType,
+    TimestampType, DateType
+)
+
+expected_schema = StructType([
+    StructField("trade_id", LongType(), False),                   # must always be present
+    StructField("trade_time", TimestampType(), False),            # parsed from API "time"
+    StructField("trade_date", DateType(), False),                 # derived from trade_time
+    StructField("price", DecimalType(18, 2), False),              # cast from string
+    StructField("size", DecimalType(18, 8), False),               # trade size with high precision
+    StructField("side", StringType(), False),                     # "buy" / "sell"
+    StructField("ingest_ts", TimestampType(), False)              # ingestion timestamp
+])
+
+dq_log_schema = StructType([
+    StructField("validation_time", TimestampType(), False),
+    StructField("job_name", StringType(), False),
+    StructField("trade_date", DateType(), False),
+    StructField("rule_name", StringType(), False),
+    StructField("status", BooleanType(), False),
+    StructField("detail", StringType(), True),
+    StructField("success_count", LongType(), True),
+    StructField("failure_count", LongType(), True),
+    StructField("bad_record", StringType(), True)
+])
+
+
+
+df_incremental = spark.read.format("delta").load(lakehouse_path).filter("trade_date='2025-09-21'")
+df_incremental.count()
+
+from pyspark.sql.functions import col, to_date, to_json, struct
+from datetime import datetime
+
+def validate_and_log(df, expected_schema, job_name="btc_usd_pipeline"):
+    dq_logs = []
+    total_count = df.count()
+
+    # Current trade_date
+    trade_date_str = df.selectExpr("max(trade_date)").first()[0]; trade_date_val = datetime.strptime(trade_date_str, '%Y-%m-%d').date()
+
+    # 1. Row Count Rule
+    dq_logs.append((datetime.utcnow(), job_name, trade_date_val,
+                    "RowCount",
+                    total_count > 0,
+                    f"{total_count} rows",
+                    total_count if total_count > 0 else 0,
+                    0 if total_count > 0 else total_count,
+                    None))
+
+    # 2. Null Checks
+    for field in expected_schema.fields:
+        null_df = df.filter(col(field.name).isNull())
+        fail_count = null_df.count()
+        success_count = total_count - fail_count
+
+        bad_payload = None
+        if fail_count > 0:
+            bad_json = null_df.withColumn("record", to_json(struct([col(c) for c in df.columns]))) \
+                              .select("record").limit(5)  # sample 5
+            bad_list = [r.record for r in bad_json.collect()]
+            bad_payload = "; ".join(bad_list)
+
+        dq_logs.append((datetime.utcnow(), job_name, trade_date_val,
+                        f"NullCheck_{field.name}",
+                        fail_count == 0,
+                        f"{fail_count} nulls",
+                        success_count,
+                        fail_count,
+                        bad_payload))
+
+    # 3. Schema Checks
+    actual_fields = {f.name: f.dataType for f in df.schema.fields}
+    for field in expected_schema.fields:
+        actual_type = actual_fields.get(field.name)
+        dq_logs.append((datetime.utcnow(), job_name, trade_date_val,
+                        f"SchemaCheck_{field.name}",
+                        actual_type == field.dataType,
+                        str(actual_type),
+                        total_count if actual_type == field.dataType else 0,
+                        0 if actual_type == field.dataType else total_count,
+                        None))
+
+    # Convert to DF
+    #dq_df = spark.createDataFrame(
+    #    dq_logs,
+    #    ["validation_time", "job_name", "trade_date", "rule_name",
+    #     "status", "detail", "success_count", "failure_count", "bad_record"]
+    #).withColumn("trade_date", to_date(col("trade_date")))
+    
+    dq_df = spark.createDataFrame(dq_logs, schema=dq_log_schema)
+
+
+    # Append to table
+    dq_df.write.format("delta").mode("append").saveAsTable("monitoring.data_quality_log")
+
+    return dq_df
+
+# Run validation and log results
+dq_log_df = validate_and_log(df_incremental, expected_schema, job_name="btc_usd_pipeline")
+
+# Show results inline
+dq_log_df.show(truncate=False)
+
+
+
+%sql
+SELECT trade_date, rule_name, SUM(failure_count) AS total_failures
+FROM monitoring.data_quality_log
+WHERE trade_date = current_date()
+GROUP BY trade_date, rule_name;
+
+
+
+%sql
+SELECT trade_date, 
+       rule_name,
+       SUM(success_count) AS passed,
+       SUM(failure_count) AS failed,
+       ROUND(SUM(success_count)*100.0 / (SUM(success_count)+SUM(failure_count)), 2) AS pass_percent
+FROM monitoring.data_quality_log
+GROUP BY trade_date, rule_name;
+
+
+
+%sql
+
+SELECT *
+FROM monitoring.data_quality_log
+where rule_name in ('SchemaCheck_trade_date','SchemaCheck_ingest_ts')
+
+/*
+For rules like SchemaCheck_trade_date and SchemaCheck_ingest_ts, the check is comparing expected type vs actual type.
+If they don’t match, you’re marking every row as “failed” (failure_count = total_count).
+But since this isn’t a row-level failure (it’s a schema mismatch), there’s no “bad record” subset to log — hence bad_record = NULL.
+*/
+
+
