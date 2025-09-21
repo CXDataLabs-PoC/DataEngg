@@ -1,0 +1,142 @@
+STORAGE_ACCOUNT = "cxdlbbronze"
+CONTAINER = "landingzone"
+Folder = "BTC-USD"
+
+lakehouse_path = f"abfss://{CONTAINER}@{STORAGE_ACCOUNT}.dfs.core.windows.net/{Folder}"
+checkpoint_path = lakehouse_path + "_checkpoint/last_trade.json"
+
+client_id = dbutils.secrets.get(scope="landingzone-secret", key="client-id")
+client_secret = dbutils.secrets.get(scope="landingzone-secret", key="client-secret")
+tenant_id = dbutils.secrets.get(scope="landingzone-secret", key="tenant-id")
+
+account_host = f"{STORAGE_ACCOUNT}.dfs.core.windows.net"
+spark.conf.set(f"fs.azure.account.auth.type.{account_host}", "OAuth")
+spark.conf.set(f"fs.azure.account.oauth.provider.type.{account_host}",
+               "org.apache.hadoop.fs.azurebfs.oauth2.ClientCredsTokenProvider")
+spark.conf.set(f"fs.azure.account.oauth2.client.id.{account_host}", client_id)
+spark.conf.set(f"fs.azure.account.oauth2.client.secret.{account_host}", client_secret)
+spark.conf.set(f"fs.azure.account.oauth2.client.endpoint.{account_host}",
+               f"https://login.microsoftonline.com/{tenant_id}/oauth2/token")
+
+#dbutils.fs.rm("abfss://landingzone@cxdlbbronze.dfs.core.windows.net/BTC-USD/", recurse=True)
+#dbutils.fs.rm("abfss://landingzone@cxdlbbronze.dfs.core.windows.net/BTC-USD_checkpoint/", recurse=True)
+
+import requests
+import json
+from pyspark.sql import SparkSession
+from pyspark.sql.types import StructType, StructField, LongType, TimestampType, DecimalType, StringType
+from pyspark.sql.functions import col, lit, max as spark_max, to_timestamp
+from datetime import datetime
+
+spark = SparkSession.builder.getOrCreate()
+
+# -------------------------
+# Config
+# -------------------------
+api_url = "https://api.exchange.coinbase.com/products/BTC-USD/trades"
+
+
+STORAGE_ACCOUNT = "cxdlbbronze"
+CONTAINER = "landingzone"
+Folder = "BTC-USD"
+
+lakehouse_path = f"abfss://{CONTAINER}@{STORAGE_ACCOUNT}.dfs.core.windows.net/{Folder}"
+checkpoint_path = lakehouse_path + "_checkpoint/last_trade.json"
+
+client_id = dbutils.secrets.get(scope="landingzone-secret", key="client-id")
+client_secret = dbutils.secrets.get(scope="landingzone-secret", key="client-secret")
+tenant_id = dbutils.secrets.get(scope="landingzone-secret", key="tenant-id")
+
+account_host = f"{STORAGE_ACCOUNT}.dfs.core.windows.net"
+spark.conf.set(f"fs.azure.account.auth.type.{account_host}", "OAuth")
+spark.conf.set(f"fs.azure.account.oauth.provider.type.{account_host}",
+               "org.apache.hadoop.fs.azurebfs.oauth2.ClientCredsTokenProvider")
+spark.conf.set(f"fs.azure.account.oauth2.client.id.{account_host}", client_id)
+spark.conf.set(f"fs.azure.account.oauth2.client.secret.{account_host}", client_secret)
+spark.conf.set(f"fs.azure.account.oauth2.client.endpoint.{account_host}",
+               f"https://login.microsoftonline.com/{tenant_id}/oauth2/token")
+
+
+# -------------------------
+# Get last watermark (trade_id)
+# -------------------------
+def get_last_trade_id():
+    try:
+        df = spark.read.json(checkpoint_path)
+        return df.collect()[0]["last_trade_id"]
+    except Exception:
+        return 0   # start from 0 for first run
+
+last_trade_id = get_last_trade_id()
+print(f"Last processed trade_id = {last_trade_id}")
+
+# -------------------------
+# Define standardized schema
+# -------------------------
+trade_schema = StructType([
+    StructField("trade_id", LongType(), False),
+    StructField("trade_time", TimestampType(), False),
+    StructField("price", DecimalType(18,2), False),
+    StructField("size", DecimalType(18,8), False),
+    StructField("side", StringType(), False),
+    StructField("ingest_ts", TimestampType(), False)
+])
+
+# -------------------------
+# Fetch trades from Coinbase API
+# -------------------------
+response = requests.get(api_url, headers={"Accept": "application/json"})
+if response.status_code != 200:
+    raise Exception(f"API call failed: {response.text}")
+
+data = response.json()
+
+# Convert to Spark DataFrame
+raw_df = spark.read.json(spark.sparkContext.parallelize([json.dumps(d) for d in data]))
+
+# Coinbase API returns fields: time, trade_id, price, size, side
+raw_df.show(5, truncate=False)
+
+# -------------------------
+# Transform + Standardize schema
+# -------------------------
+df = (raw_df
+    .withColumn("trade_id", col("trade_id").cast(LongType()))
+    .withColumn("trade_time", to_timestamp(col("time")))
+    .withColumn("price", col("price").cast(DecimalType(18,2)))
+    .withColumn("size", col("size").cast(DecimalType(18,8)))
+    .withColumn("ingest_ts", lit(datetime.utcnow()))
+    .select("trade_id", "trade_time", "price", "size", "side", "ingest_ts")
+)
+
+# -------------------------
+# Filter Incremental Records
+# -------------------------
+df_incremental = df.filter(col("trade_id") > last_trade_id)
+
+if df_incremental.count() == 0:
+    print("No new trades to load.")
+else:
+    # Add load timestamp for auditing
+    df_incremental = df_incremental.withColumn("ingest_ts", lit(datetime.now().isoformat()))
+
+    # -------------------------
+    # Write to Azure Data Lakehouse (Delta format)
+    # -------------------------
+    df_incremental.write.format("delta").mode("append").save(lakehouse_path)
+
+    # -------------------------
+    # Update watermark
+    # -------------------------
+    new_trade_id = df_incremental.agg(spark_max("trade_id")).collect()[0][0]
+    spark.createDataFrame([{"last_trade_id": new_trade_id}]).write.mode("append").json(checkpoint_path)
+
+    print(f"✅ Loaded {df_incremental.count()} new trades. Updated watermark = {new_trade_id}")
+
+%sql
+SELECT COUNT(*) AS total_trades,
+       MIN(trade_time) AS first_trade,
+       MAX(trade_time) AS last_trade
+FROM hive_metastore.raw_bronze.btc_usd_trades;
+ 
+
