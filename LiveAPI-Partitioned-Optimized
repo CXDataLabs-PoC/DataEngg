@@ -160,4 +160,4 @@ else:
     new_trade_id = df_incremental.agg(spark_max("trade_id")).collect()[0][0]
     spark.createDataFrame([{"last_trade_id": new_trade_id}]).write.mode("append").json(checkpoint_path)
 
-    print(f"✅ Loaded {df_incremental.count()} new trades. Updated watermark = {new_trade_id}")
+    print(f" Loaded {df_incremental.count()} new trades. Updated watermark = {new_trade_id}")
